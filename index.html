@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1b2d">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>Boarding scanner</title>
+<style>
+  :root {
+    --bg: #0f1b2d;
+    --panel: #172742;
+    --text: #f2f5fa;
+    --muted: #9fb0c8;
+    --ok: #1f9d55;
+    --warn: #d98e04;
+    --bad: #c8342b;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 18px 20px 8px; display: flex; align-items: baseline; gap: 10px; }
+  #count { font-size: 44px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  header span { color: var(--muted); font-size: 18px; }
+  main { padding: 8px 20px 24px; max-width: 460px; margin: 0 auto; }
+  #reader { width: 100%; border-radius: 14px; overflow: hidden; background: #000; min-height: 280px; }
+  #hint { color: var(--muted); margin: 12px 2px 20px; font-size: 15px; }
+  form { display: flex; gap: 8px; }
+  input { flex: 1; min-width: 0; font: inherit; font-size: 17px; padding: 14px; border-radius: 10px;
+    border: 1px solid #2c4166; background: var(--panel); color: var(--text); text-transform: uppercase; }
+  input::placeholder { color: var(--muted); text-transform: none; }
+  button { font: inherit; font-weight: 600; font-size: 17px; padding: 14px 18px; border-radius: 10px;
+    border: 0; background: #3b82f6; color: #fff; cursor: pointer; }
+  :focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+
+  #result { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; padding: 24px; z-index: 10; }
+  #result[hidden] { display: none; }
+  #result.valid { background: var(--ok); }
+  #result.used { background: var(--warn); }
+  #result.invalid, #result.error { background: var(--bad); }
+  #status { font-size: 20px; font-weight: 600; opacity: .92; }
+  #name { font-size: clamp(34px, 10vw, 56px); font-weight: 800; line-height: 1.1; margin: 14px 0 10px;
+    letter-spacing: -0.02em; overflow-wrap: anywhere; }
+  #detail { font-size: 18px; opacity: .92; min-height: 1.4em; }
+  #next { margin-top: 36px; background: rgba(255,255,255,.2); border: 2px solid rgba(255,255,255,.7); }
+</style>
+</head>
+<body>
+<header>
+  <div id="count">–</div><span id="countLabel">boarded</span>
+</header>
+<main>
+  <div id="reader"></div>
+  <p id="hint">Point the camera at the ticket QR code.</p>
+  <form id="manual" autocomplete="off">
+    <input id="code" placeholder="Or type the backup code" autocapitalize="characters" spellcheck="false">
+    <button type="submit">Check</button>
+  </form>
+</main>
+
+<div id="result" class="valid" hidden role="alert">
+  <div id="status"></div>
+  <div id="name"></div>
+  <div id="detail"></div>
+  <button id="next" type="button">Scan next</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+// ====== SETTINGS ======
+const API_URL = 'PASTE_YOUR_WEB_APP_URL_HERE'; // the Apps Script "Web app" URL ending in /exec
+// ======================
+
+const $ = id => document.getElementById(id);
+let pin = localStorage.getItem('pin') || '';
+let busy = false;
+let autoClose = null;
+let scanner = null;
+
+function askPin() {
+  const v = prompt('Enter the admin PIN');
+  if (v) { pin = v.trim(); localStorage.setItem('pin', pin); }
+}
+
+async function api(params) {
+  const u = new URL(API_URL);
+  Object.entries({ ...params, pin }).forEach(([k, v]) => u.searchParams.set(k, v));
+  const r = await fetch(u.toString());
+  return r.json();
+}
+
+function setCount(s) {
+  if (s) $('count').textContent = s.used + ' / ' + s.total;
+}
+
+function beep(ok) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = ok ? 880 : 220; g.gain.value = 0.08;
+    o.connect(g); g.connect(ctx.destination); o.start();
+    o.stop(ctx.currentTime + (ok ? 0.12 : 0.35));
+  } catch (e) {}
+}
+
+function show(kind, status, name, detail) {
+  const r = $('result');
+  r.className = kind;
+  $('status').textContent = status;
+  $('name').textContent = name || '';
+  $('detail').textContent = detail || '';
+  r.hidden = false;
+  if (navigator.vibrate) navigator.vibrate(kind === 'valid' ? 80 : [200, 100, 200]);
+  beep(kind === 'valid');
+  clearTimeout(autoClose);
+  if (kind === 'valid') autoClose = setTimeout(dismiss, 2200);
+}
+
+function dismiss() {
+  clearTimeout(autoClose);
+  $('result').hidden = true;
+  $('code').value = '';
+  busy = false;
+  try { scanner && scanner.resume(); } catch (e) {}
+}
+
+async function handle(raw) {
+  const code = String(raw || '').trim().toUpperCase();
+  if (!code || busy) return;
+  busy = true;
+  try { scanner && scanner.pause(true); } catch (e) {}
+
+  if (!pin) askPin();
+  try {
+    const res = await api({ action: 'scan', code });
+    if (res.status === 'WRONG_PIN') {
+      localStorage.removeItem('pin'); pin = '';
+      show('error', 'Wrong PIN', 'Try again', 'Tap "Scan next", then enter the PIN when asked.');
+      return;
+    }
+    setCount(res.stats);
+    if (res.status === 'VALID') show('valid', 'Valid ticket', res.name, 'Boarding recorded');
+    else if (res.status === 'ALREADY_USED')
+      show('used', 'Already used', res.name, res.at ? 'Scanned earlier at ' + res.at : 'Scanned earlier');
+    else if (res.status === 'INVALID')
+      show('invalid', 'Not a valid ticket', 'No match', 'Ask for their student ID and check the list.');
+    else show('error', 'Problem', res.message || 'Unknown error', '');
+  } catch (e) {
+    show('error', 'No connection', 'Not checked', 'Ticket was not marked. Check your data and scan again.');
+  }
+}
+
+async function loadStats() {
+  if (!pin) askPin();
+  try {
+    const s = await api({ action: 'stats' });
+    if (s.status === 'WRONG_PIN') { localStorage.removeItem('pin'); pin = ''; return; }
+    setCount(s);
+  } catch (e) { /* offline: leave count as is */ }
+}
+
+$('next').addEventListener('click', dismiss);
+$('manual').addEventListener('submit', e => { e.preventDefault(); handle($('code').value); });
+
+window.addEventListener('load', () => {
+  loadStats();
+  scanner = new Html5Qrcode('reader');
+  scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } },
+    text => handle(text), () => {})
+    .catch(() => {
+      $('hint').textContent = 'Camera is blocked. Allow camera access in the browser, or type codes below.';
+    });
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+});
+</script>
+</body>
+</html>
