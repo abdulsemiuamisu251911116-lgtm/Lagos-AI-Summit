@@ -42,6 +42,7 @@
   #result[hidden] { display: none; }
   #result.valid { background: var(--ok); }
   #result.used { background: var(--warn); }
+  #result.checking { background: #2c4166; }
   #result.invalid, #result.error { background: var(--bad); }
   #status { font-size: 20px; font-weight: 600; opacity: .92; }
   #name { font-size: clamp(34px, 10vw, 56px); font-weight: 800; line-height: 1.1; margin: 14px 0 10px;
@@ -115,6 +116,8 @@ function show(kind, status, name, detail) {
   $('name').textContent = name || '';
   $('detail').textContent = detail || '';
   r.hidden = false;
+  $('next').hidden = (kind === 'checking');
+  if (kind === 'checking') return;
   if (navigator.vibrate) navigator.vibrate(kind === 'valid' ? 80 : [200, 100, 200]);
   beep(kind === 'valid');
   clearTimeout(autoClose);
@@ -136,6 +139,7 @@ async function handle(raw) {
   try { scanner && scanner.pause(true); } catch (e) {}
 
   if (!pin) askPin();
+  show('checking', 'Checking ticket…', '', '');
   try {
     const res = await api({ action: 'scan', code });
     if (res.status === 'WRONG_PIN') {
@@ -169,6 +173,8 @@ $('manual').addEventListener('submit', e => { e.preventDefault(); handle($('code
 
 window.addEventListener('load', () => {
   loadStats();
+  // Refresh the count and keep the backend warm so scans respond faster
+  setInterval(() => { if (!busy && pin) loadStats(); }, 40000);
   scanner = new Html5Qrcode('reader');
   scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } },
     text => handle(text), () => {})
